@@ -39,36 +39,6 @@ static void censor_inplace(char *data, size_t len, const char *word)
 }
 
 // ---------------------------------------------------------------------------
-// PATH search  (same semantics as execvp, but returns the full path)
-// ---------------------------------------------------------------------------
-
-static std::string find_in_path(const std::string &name)
-{
-    // If name already contains a slash, use as-is
-    if (name.find('/') != std::string::npos)
-        return name;
-
-    const char *path_env = std::getenv("PATH");
-    if (!path_env) path_env = "/usr/local/bin:/usr/bin:/bin";
-
-    std::string path_str(path_env);
-    size_t start = 0;
-    while (true) {
-        size_t colon = path_str.find(':', start);
-        std::string dir = path_str.substr(start, colon == std::string::npos
-                                                  ? std::string::npos
-                                                  : colon - start);
-        if (dir.empty()) dir = ".";
-        std::string full = dir + "/" + name;
-        if (access(full.c_str(), X_OK) == 0)
-            return full;
-        if (colon == std::string::npos) break;
-        start = colon + 1;
-    }
-    return {}; // not found
-}
-
-// ---------------------------------------------------------------------------
 // Terminal helpers
 // ---------------------------------------------------------------------------
 
@@ -120,10 +90,10 @@ static void handle_sigterm(int sig)
 
 const char *BANNED = "penis";
 const size_t BUFSIZE = 4096;
-char buf[BUFSIZE];
 
 static bool proxy_child_output(int read_fd, int write_fd)
 {
+    char buf[BUFSIZE];
     ssize_t n = read(read_fd, buf, BUFSIZE);
     if (n > 0) {
         censor_inplace(buf, n, BANNED);
@@ -142,34 +112,12 @@ static bool proxy_child_output(int read_fd, int write_fd)
     return false;
 }
 
-static bool proxy_child_output_drain(int read_fd, int write_fd)
-{
-    ssize_t n = read(read_fd, buf, BUFSIZE);
-    if (n > 0) {
-        censor_inplace(buf, n, BANNED);
-        const char *ptr = buf;
-        while (n > 0) {
-            ssize_t w = write(write_fd, ptr, n);
-            if (w < 0) return true;
-            ptr += w; n -= w;
-        }
-        return false;
-    }
-    // n == 0 (EOF на pipe) или EIO (PTY master после закрытия slave)
-    if (n < 0 && errno == EAGAIN) return false; // не должно быть, но на всякий случай
-    return true; // EOF или EIO — дренаж завершён
-}
-
 int main(int argc, char *argv[])
 {
     if (argc < 2)
         return 0;
 
-    std::string binary = find_in_path(argv[1]);
-    if (binary.empty()) {
-        fprintf(stderr, "%s: command not found: %s\n", argv[0], argv[1]);
-        return 127;
-    }
+    char *command = argv[1];
 
     std::vector<char *> child_argv(argv + 1, argv + argc);
     child_argv.push_back(nullptr);
@@ -197,8 +145,8 @@ int main(int argc, char *argv[])
         }
         if (child_pid == 0) {
             // Child: PTY is already set as stdin/stdout/stderr by forkpty
-            execv(binary.c_str(), child_argv.data());
-            perror(binary.c_str());
+            execvp(command, child_argv.data());
+            perror(command);
             _exit(127);
         }
         // Parent
@@ -233,8 +181,8 @@ int main(int argc, char *argv[])
             close(pipe_stdin[0]);  close(pipe_stdin[1]);
             close(pipe_stdout[0]); close(pipe_stdout[1]);
             close(pipe_stderr[0]); close(pipe_stderr[1]);
-            execv(binary.c_str(), child_argv.data());
-            perror(binary.c_str());
+            execvp(command, child_argv.data());
+            perror(command);
             _exit(127);
         }
         // Parent: close child-side ends
@@ -260,24 +208,19 @@ int main(int argc, char *argv[])
     }
 
     bool child_out_closed = false;
-    bool child_err_closed = false;
+    bool child_err_closed = use_pty;
     bool stdin_closed     = false;
 
-    while (true) {
-        // Check if child exited and all output drained
-        if (child_out_closed && child_err_closed) break;
-
+    while (!child_out_closed || !child_err_closed) {
         fd_set rfds;
         FD_ZERO(&rfds);
         if (!stdin_closed)     FD_SET(STDIN_FILENO, &rfds);
         if (!child_out_closed) FD_SET(read_from_child, &rfds);
-        if (!child_err_closed && !use_pty) FD_SET(error_from_child, &rfds);
+        if (!child_err_closed) FD_SET(error_from_child, &rfds);
 
         int maxfd = std::max({STDIN_FILENO, read_from_child, error_from_child}) + 1;
 
-        // Short timeout so we can detect child exit even when no data flows
-        struct timeval tv = {0, 50000}; // 50 ms
-        int sel = select(maxfd, &rfds, nullptr, nullptr, &tv);
+        int sel = select(maxfd, &rfds, nullptr, nullptr, nullptr);
 
         if (sel < 0) {
             if (errno == EINTR) continue;
@@ -285,7 +228,8 @@ int main(int argc, char *argv[])
         }
 
         // ---- stdin → child ------------------------------------------------
-        if (!stdin_closed && FD_ISSET(STDIN_FILENO, &rfds)) {
+        if (FD_ISSET(STDIN_FILENO, &rfds)) {
+            char buf[BUFSIZE];
             ssize_t n = read(STDIN_FILENO, buf, BUFSIZE);
             if (n > 0) {
                 // Write all to child
@@ -304,49 +248,13 @@ int main(int argc, char *argv[])
         }
 
         // ---- child stdout → our stdout ------------------------------------
-        if (!child_out_closed && FD_ISSET(read_from_child, &rfds)) {
-            usleep(1000000);
+        if (FD_ISSET(read_from_child, &rfds)) {
             child_out_closed = proxy_child_output(read_from_child, STDOUT_FILENO);
         }
 
         // ---- child stderr → our stderr ------------------------------------
-        if (!child_err_closed && FD_ISSET(error_from_child, &rfds)) {
-            usleep(1000000);
+        if (FD_ISSET(error_from_child, &rfds)) {
             child_err_closed = proxy_child_output(error_from_child, STDERR_FILENO);
-        }
-
-        // ---- detect child exit --------------------------------------------
-        {
-            int status = 0;
-            pid_t r = waitpid(child_pid, &status, WNOHANG);
-            if (r == child_pid) {
-                fcntl(read_from_child, F_SETFL,
-                          fcntl(read_from_child, F_GETFL) & ~O_NONBLOCK);
-                if (!use_pty) {
-                    fcntl(error_from_child, F_SETFL,
-                            fcntl(error_from_child, F_GETFL) & ~O_NONBLOCK);
-                }
-
-                // fcntl(read_from_child, F_SETFL, fcntl(read_from_child, F_GETFL) & ~O_NONBLOCK);
-                while (!child_out_closed)
-                    child_out_closed = proxy_child_output_drain(read_from_child, STDOUT_FILENO);
-                    // child_out_closed = proxy_child_output(read_from_child, STDOUT_FILENO);
-
-                // fcntl(error_from_child, F_SETFL, fcntl(error_from_child, F_GETFL) & ~O_NONBLOCK);
-                while (!child_err_closed)
-                    child_err_closed = proxy_child_output_drain(error_from_child, STDERR_FILENO);
-                    // child_err_closed = proxy_child_output(error_from_child, STDERR_FILENO);
-
-                printf("process exited\r\n");
-                restore_termios();
-
-                // Restore stdin flags
-                fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
-
-                if (WIFEXITED(status))   return WEXITSTATUS(status);
-                if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-                return 1;
-            }
         }
     }
 
