@@ -12,32 +12,25 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
-#include <util.h>
+#ifdef __APPLE__
+    #include <util.h>
+#else
+    #include <pty.h>
+#endif
 #include <termios.h>
 
 // ---------------------------------------------------------------------------
 // Word censoring
 // ---------------------------------------------------------------------------
 
-// Replace every occurrence of `word` (case-insensitive) with asterisks
-// inside `data`. Only whole-chunk scanning; edges are NOT stitched across
-// calls (by design – caller is responsible for passing complete chunks).
-static void censor_word(std::string &data, const std::string &word)
+static void censor_inplace(char *data, size_t len, const char *word)
 {
-    if (word.empty() || data.size() < word.size()) return;
-
-    const size_t wlen = word.size();
+    const size_t wlen = strlen(word);
+    if (wlen == 0 || len < wlen) return;
     size_t pos = 0;
-
-    while (pos + wlen <= data.size()) {
-        // Case-insensitive compare
-        bool match = true;
-        for (size_t i = 0; i < wlen && match; ++i) {
-            match = (std::tolower((unsigned char)data[pos + i]) ==
-                     std::tolower((unsigned char)word[i]));
-        }
-        if (match) {
-            std::fill(data.begin() + pos, data.begin() + pos + wlen, '*');
+    while (pos + wlen <= len) {
+        if (strncasecmp(data + pos, word, wlen) == 0) {
+            memset(data + pos, '*', wlen);
             pos += wlen;
         } else {
             ++pos;
@@ -65,7 +58,6 @@ static std::string find_in_path(const std::string &name)
         std::string dir = path_str.substr(start, colon == std::string::npos
                                                   ? std::string::npos
                                                   : colon - start);
-        fprintf(stderr, "dir: %s\n", dir.c_str());
         if (dir.empty()) dir = ".";
         std::string full = dir + "/" + name;
         if (access(full.c_str(), X_OK) == 0)
@@ -126,29 +118,60 @@ static void handle_sigterm(int sig)
     _exit(128 + sig);
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+const char *BANNED = "penis";
+const size_t BUFSIZE = 4096;
+char buf[BUFSIZE];
+
+static bool proxy_child_output(int read_fd, int write_fd)
+{
+    ssize_t n = read(read_fd, buf, BUFSIZE);
+    if (n > 0) {
+        censor_inplace(buf, n, BANNED);
+
+        const char *ptr = buf;
+        while (n > 0) {
+            ssize_t w = write(write_fd, ptr, n);
+            if (w < 0) break;
+            ptr  += w;
+            n -= w;
+        }
+    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool proxy_child_output_drain(int read_fd, int write_fd)
+{
+    ssize_t n = read(read_fd, buf, BUFSIZE);
+    if (n > 0) {
+        censor_inplace(buf, n, BANNED);
+        const char *ptr = buf;
+        while (n > 0) {
+            ssize_t w = write(write_fd, ptr, n);
+            if (w < 0) return true;
+            ptr += w; n -= w;
+        }
+        return false;
+    }
+    // n == 0 (EOF на pipe) или EIO (PTY master после закрытия slave)
+    if (n < 0 && errno == EAGAIN) return false; // не должно быть, но на всякий случай
+    return true; // EOF или EIO — дренаж завершён
+}
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
-        return 1;
-    }
+    if (argc < 2)
+        return 0;
 
-    // ----- Locate binary ---------------------------------------------------
     std::string binary = find_in_path(argv[1]);
     if (binary.empty()) {
         fprintf(stderr, "%s: command not found: %s\n", argv[0], argv[1]);
         return 127;
     }
 
-    // Build argv for exec
-    std::vector<char *> child_argv;
-    child_argv.push_back(argv[1]); // keep original name as argv[0]
-    for (int i = 2; i < argc; ++i)
-        child_argv.push_back(argv[i]);
+    std::vector<char *> child_argv(argv + 1, argv + argc);
     child_argv.push_back(nullptr);
 
     // ----- Decide: PTY or plain pipes --------------------------------------
@@ -158,6 +181,7 @@ int main(int argc, char *argv[])
     int pty_master = -1;
     int pipe_stdin[2]  = {-1, -1}; // [read, write]
     int pipe_stdout[2] = {-1, -1};
+    int pipe_stderr[2] = {-1, -1};
 
     pid_t child_pid;
 
@@ -192,7 +216,7 @@ int main(int argc, char *argv[])
 
     } else {
         // --- plain pipes ---------------------------------------------------
-        if (pipe(pipe_stdin) < 0 || pipe(pipe_stdout) < 0) {
+        if (pipe(pipe_stdin) < 0 || pipe(pipe_stdout) < 0 || pipe(pipe_stderr) < 0) {
             perror("pipe");
             return 1;
         }
@@ -203,12 +227,12 @@ int main(int argc, char *argv[])
             return 1;
         }
         if (child_pid == 0) {
-            // Child: wire up pipes
             dup2(pipe_stdin[0],  STDIN_FILENO);
             dup2(pipe_stdout[1], STDOUT_FILENO);
-            dup2(pipe_stdout[1], STDERR_FILENO);
+            dup2(pipe_stderr[1], STDERR_FILENO);
             close(pipe_stdin[0]);  close(pipe_stdin[1]);
             close(pipe_stdout[0]); close(pipe_stdout[1]);
+            close(pipe_stderr[0]); close(pipe_stderr[1]);
             execv(binary.c_str(), child_argv.data());
             perror(binary.c_str());
             _exit(127);
@@ -216,18 +240,13 @@ int main(int argc, char *argv[])
         // Parent: close child-side ends
         close(pipe_stdin[0]);
         close(pipe_stdout[1]);
+        close(pipe_stderr[1]);
         g_child_pid = child_pid;
     }
 
-    // -----------------------------------------------------------------------
-    // Proxy loop
-    // -----------------------------------------------------------------------
-    const std::string BANNED = "penis";
-    const size_t BUFSIZE = 4096;
-    char buf[BUFSIZE];
-
     // fds we read from
     int read_from_child  = use_pty ? pty_master : pipe_stdout[0];
+    int error_from_child = pipe_stderr[0];
     int write_to_child   = use_pty ? pty_master : pipe_stdin[1];
 
     // Make our own stdin non-blocking
@@ -235,20 +254,26 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags | O_NONBLOCK);
     fcntl(read_from_child, F_SETFL,
           fcntl(read_from_child, F_GETFL) | O_NONBLOCK);
+    if (!use_pty) {
+        fcntl(error_from_child, F_SETFL,
+              fcntl(error_from_child, F_GETFL) | O_NONBLOCK);
+    }
 
     bool child_out_closed = false;
+    bool child_err_closed = false;
     bool stdin_closed     = false;
 
     while (true) {
         // Check if child exited and all output drained
-        if (child_out_closed) break;
+        if (child_out_closed && child_err_closed) break;
 
         fd_set rfds;
         FD_ZERO(&rfds);
         if (!stdin_closed)     FD_SET(STDIN_FILENO, &rfds);
         if (!child_out_closed) FD_SET(read_from_child, &rfds);
+        if (!child_err_closed && !use_pty) FD_SET(error_from_child, &rfds);
 
-        int maxfd = std::max(STDIN_FILENO, read_from_child) + 1;
+        int maxfd = std::max({STDIN_FILENO, read_from_child, error_from_child}) + 1;
 
         // Short timeout so we can detect child exit even when no data flows
         struct timeval tv = {0, 50000}; // 50 ms
@@ -280,22 +305,14 @@ int main(int argc, char *argv[])
 
         // ---- child stdout → our stdout ------------------------------------
         if (!child_out_closed && FD_ISSET(read_from_child, &rfds)) {
-            ssize_t n = read(read_from_child, buf, BUFSIZE);
-            if (n > 0) {
-                std::string chunk(buf, n);
-                censor_word(chunk, BANNED);
-                // Write full censored chunk
-                const char *ptr = chunk.data();
-                ssize_t left = (ssize_t)chunk.size();
-                while (left > 0) {
-                    ssize_t w = write(STDOUT_FILENO, ptr, left);
-                    if (w < 0) break;
-                    ptr  += w;
-                    left -= w;
-                }
-            } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                child_out_closed = true;
-            }
+            usleep(1000000);
+            child_out_closed = proxy_child_output(read_from_child, STDOUT_FILENO);
+        }
+
+        // ---- child stderr → our stderr ------------------------------------
+        if (!child_err_closed && FD_ISSET(error_from_child, &rfds)) {
+            usleep(1000000);
+            child_err_closed = proxy_child_output(error_from_child, STDERR_FILENO);
         }
 
         // ---- detect child exit --------------------------------------------
@@ -303,23 +320,24 @@ int main(int argc, char *argv[])
             int status = 0;
             pid_t r = waitpid(child_pid, &status, WNOHANG);
             if (r == child_pid) {
-                // Drain any remaining output before exiting
-                // One last non-blocking drain pass
-                for (;;) {
-                    ssize_t n = read(read_from_child, buf, BUFSIZE);
-                    if (n <= 0) break;
-                    std::string chunk(buf, n);
-                    censor_word(chunk, BANNED);
-                    const char *ptr = chunk.data();
-                    ssize_t left = (ssize_t)chunk.size();
-                    while (left > 0) {
-                        ssize_t w = write(STDOUT_FILENO, ptr, left);
-                        if (w < 0) break;
-                        ptr  += w;
-                        left -= w;
-                    }
+                fcntl(read_from_child, F_SETFL,
+                          fcntl(read_from_child, F_GETFL) & ~O_NONBLOCK);
+                if (!use_pty) {
+                    fcntl(error_from_child, F_SETFL,
+                            fcntl(error_from_child, F_GETFL) & ~O_NONBLOCK);
                 }
 
+                // fcntl(read_from_child, F_SETFL, fcntl(read_from_child, F_GETFL) & ~O_NONBLOCK);
+                while (!child_out_closed)
+                    child_out_closed = proxy_child_output_drain(read_from_child, STDOUT_FILENO);
+                    // child_out_closed = proxy_child_output(read_from_child, STDOUT_FILENO);
+
+                // fcntl(error_from_child, F_SETFL, fcntl(error_from_child, F_GETFL) & ~O_NONBLOCK);
+                while (!child_err_closed)
+                    child_err_closed = proxy_child_output_drain(error_from_child, STDERR_FILENO);
+                    // child_err_closed = proxy_child_output(error_from_child, STDERR_FILENO);
+
+                printf("process exited\r\n");
                 restore_termios();
 
                 // Restore stdin flags
